@@ -12,12 +12,6 @@ import (
 	"time"
 )
 
-type Frame struct {
-	Kind     byte
-	StreamID uint32
-	Payload  []byte
-}
-
 type StreamState struct {
 	ID   uint32
 	Conn net.Conn
@@ -28,6 +22,26 @@ var (
 	sm      sync.Mutex
 )
 
+func SendRegistor(clientID string, writeCh chan protocol.Frame) error {
+	ctrl := protocol.ControlMessage{
+		Type: "register",
+		From: clientID,
+	}
+
+	payload, err := json.Marshal(ctrl)
+	if err != nil {
+		return err
+	}
+
+	writeCh <- protocol.Frame{
+		Kind:     protocol.KindControl,
+		StreamID: 0,
+		Payload:  payload,
+	}
+	return nil
+
+}
+
 func StartClient(serverAddr, clientID string) error {
 	conn, err := net.Dial("tcp", serverAddr)
 	if err != nil {
@@ -37,10 +51,13 @@ func StartClient(serverAddr, clientID string) error {
 
 	log.Printf("Connected to server at %s", serverAddr)
 
-	writeCh := make(chan Frame, 128)
+	writeCh := make(chan protocol.Frame, 128)
 	stop := make(chan struct{})
 
 	go writer(conn, writeCh, stop)
+	if err := SendRegistor(clientID, writeCh); err != nil {
+		return err
+	}
 
 	go startHeartbeat(writeCh, clientID, stop)
 
@@ -66,30 +83,47 @@ func StartClient(serverAddr, clientID string) error {
 	}
 }
 
-func handleControl(msg protocol.ControlMessage, writeCh chan<- Frame) {
+func handleControl(msg protocol.ControlMessage, writeCh chan<- protocol.Frame) {
 	switch msg.Type {
 	case "open_stream":
+		log.Println("got the open_stream message ")
+		log.Println(msg.StreamID)
 		go openLocalStream(msg.StreamID, writeCh)
 
 	case "close_stream":
 		closeLocalStream(msg.StreamID)
+		log.Println("got the close_stream message ")
+		log.Printf("%s", msg.StreamID)
 	}
 }
 
 func handleData(streamID uint32, payload []byte) {
-	sm.Lock()
-	stream, ok := streams[streamID]
-	sm.Unlock()
+	var stream *StreamState
 
-	if ok {
-		_, err := stream.Conn.Write(payload)
-		if err != nil {
-			closeLocalStream(streamID)
+	// wait up to 100ms for stream to appear
+	for i := 0; i < 10; i++ {
+		sm.Lock()
+		stream = streams[streamID]
+		sm.Unlock()
+
+		if stream != nil {
+			break
 		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	if stream == nil {
+		log.Printf("CLIENT: data for unknown stream %d (dropped)", streamID)
+		return
+	}
+
+	_, err := stream.Conn.Write(payload)
+	if err != nil {
+		closeLocalStream(streamID)
 	}
 }
 
-func openLocalStream(streamID uint32, writeCh chan<- Frame) {
+func openLocalStream(streamID uint32, writeCh chan<- protocol.Frame) {
 	conn, err := net.Dial("tcp", "127.0.0.1:3000")
 	if err != nil {
 		log.Printf("Failed to dial local app: %v", err)
@@ -103,11 +137,12 @@ func openLocalStream(streamID uint32, writeCh chan<- Frame) {
 		Conn: conn,
 	}
 	sm.Unlock()
+	log.Println("stream opened")
 
 	go localToTunnel(streamID, conn, writeCh)
 }
 
-func localToTunnel(streamID uint32, localConn net.Conn, writeCh chan<- Frame) {
+func localToTunnel(streamID uint32, localConn net.Conn, writeCh chan<- protocol.Frame) {
 	buf := make([]byte, 32*1024)
 	defer closeLocalStream(streamID)
 
@@ -122,11 +157,12 @@ func localToTunnel(streamID uint32, localConn net.Conn, writeCh chan<- Frame) {
 		payload := make([]byte, n)
 		copy(payload, buf[:n])
 
-		writeCh <- Frame{
+		writeCh <- protocol.Frame{
 			Kind:     protocol.KindData,
 			StreamID: streamID,
 			Payload:  payload,
 		}
+		log.Println("message send to tunnel ")
 	}
 }
 
@@ -143,21 +179,21 @@ func closeLocalStream(streamID uint32) {
 	stream.Conn.Close()
 }
 
-func sendCloseStream(streamID uint32, writeCh chan<- Frame) {
+func sendCloseStream(streamID uint32, writeCh chan<- protocol.Frame) {
 	ctrl := protocol.ControlMessage{
 		Type:     "close_stream",
 		StreamID: streamID,
 	}
 	payload, _ := json.Marshal(ctrl)
 
-	writeCh <- Frame{
+	writeCh <- protocol.Frame{
 		Kind:     protocol.KindControl,
 		StreamID: 0,
 		Payload:  payload,
 	}
 }
 
-func startHeartbeat(writeCh chan<- Frame, clientID string, stop <-chan struct{}) {
+func startHeartbeat(writeCh chan<- protocol.Frame, clientID string, stop <-chan struct{}) {
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
 
@@ -170,18 +206,19 @@ func startHeartbeat(writeCh chan<- Frame, clientID string, stop <-chan struct{})
 			}
 			payload, _ := json.Marshal(ctrl)
 
-			writeCh <- Frame{
+			writeCh <- protocol.Frame{
 				Kind:     protocol.KindControl,
 				StreamID: 0,
 				Payload:  payload,
 			}
+
 		case <-stop:
 			return
 		}
 	}
 }
 
-func writer(conn net.Conn, writeCh <-chan Frame, stop <-chan struct{}) {
+func writer(conn net.Conn, writeCh <-chan protocol.Frame, stop <-chan struct{}) {
 	for {
 		select {
 		case frame, ok := <-writeCh:
@@ -189,6 +226,7 @@ func writer(conn net.Conn, writeCh <-chan Frame, stop <-chan struct{}) {
 				return
 			}
 			if err := writeFrame(conn, frame); err != nil {
+				log.Println("frame send ")
 				return
 			}
 		case <-stop:
@@ -197,34 +235,34 @@ func writer(conn net.Conn, writeCh <-chan Frame, stop <-chan struct{}) {
 	}
 }
 
-func readFrame(conn net.Conn) (Frame, error) {
+func readFrame(conn net.Conn) (protocol.Frame, error) {
 	var length uint32
 
 	if err := binary.Read(conn, binary.BigEndian, &length); err != nil {
-		return Frame{}, err
+		return protocol.Frame{}, err
 	}
 
 	if length > 5_000_000 {
-		return Frame{}, errors.New("frame too large")
+		return protocol.Frame{}, errors.New("frame too large")
 	}
 
 	buf := make([]byte, length)
 	if _, err := io.ReadFull(conn, buf); err != nil {
-		return Frame{}, err
+		return protocol.Frame{}, err
 	}
 
 	if len(buf) < 5 {
-		return Frame{}, errors.New("frame too short")
+		return protocol.Frame{}, errors.New("frame too short")
 	}
 
-	return Frame{
+	return protocol.Frame{
 		Kind:     buf[0],
 		StreamID: binary.BigEndian.Uint32(buf[1:5]),
 		Payload:  buf[5:],
 	}, nil
 }
 
-func writeFrame(conn net.Conn, frame Frame) error {
+func writeFrame(conn net.Conn, frame protocol.Frame) error {
 
 	length := uint32(1 + 4 + len(frame.Payload))
 

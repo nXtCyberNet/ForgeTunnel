@@ -68,6 +68,7 @@ func handleAgentRegistration(conn net.Conn) {
 		conn.Close()
 		return
 	}
+	log.Printf("Register payload: %s", string(frame.Payload))
 
 	if ctrl.Type != "register" || ctrl.From == "" {
 		log.Println("Invalid register command")
@@ -253,32 +254,39 @@ func handleData(client *ClientState, streamID uint32, payload []byte) {
 		}
 	}
 }
+func mustJSON(v any) []byte {
+	b, _ := json.Marshal(v)
+	return b
+}
 
 func sendControl(client *ClientState, typeStr string, streamID uint32) {
-	ctrl := protocol.ControlMessage{
-		Type:     typeStr,
-		StreamID: streamID,
+	frame := protocol.Frame{
+		Kind: protocol.KindControl,
+		Payload: mustJSON(protocol.ControlMessage{
+			Type:     typeStr,
+			StreamID: streamID,
+		}),
 	}
-	payload, _ := json.Marshal(ctrl)
 
-	client.WriteCh <- protocol.Frame{
-		Kind:    protocol.KindControl,
-		Payload: payload,
+	select {
+	case client.WriteCh <- frame:
+	default:
+
 	}
 }
 
 func closeStream(client *ClientState, streamID uint32) {
 	client.mu.Lock()
 	conn, ok := client.Streams[streamID]
-	if ok {
-		conn.Close()
-		delete(client.Streams, streamID)
+	if !ok {
+		client.mu.Unlock()
+		return
 	}
+	delete(client.Streams, streamID)
 	client.mu.Unlock()
 
-	if ok {
-		sendControl(client, "close_stream", streamID)
-	}
+	conn.Close()
+	sendControl(client, "close_stream", streamID)
 }
 
 func cleanupClient(subdomain string) {
@@ -295,10 +303,15 @@ func cleanupClient(subdomain string) {
 		client.mu.Unlock()
 	}
 	registryMu.Unlock()
+
 	log.Printf("Cleaned up client: %s", subdomain)
 }
 
 func agentWriter(client *ClientState) {
+	defer func() {
+		client.Conn.Close()
+	}()
+
 	for frame := range client.WriteCh {
 		if err := writeFrame(client.Conn, frame); err != nil {
 			return
@@ -344,4 +357,26 @@ func writeFrame(conn net.Conn, frame protocol.Frame) error {
 	}
 	_, err := conn.Write(frame.Payload)
 	return err
+}
+
+func StartHeartbeatReaper(timeout time.Duration) {
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		now := time.Now()
+
+		registryMu.Lock()
+		for id, client := range hostRegistry {
+			client.mu.Lock()
+			last := client.LastSeen
+			client.mu.Unlock()
+
+			if now.Sub(last) > timeout {
+				log.Printf("Agent timed out: %s", id)
+				go cleanupClient(id)
+			}
+		}
+		registryMu.Unlock()
+	}
 }
