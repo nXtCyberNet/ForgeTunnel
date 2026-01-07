@@ -3,6 +3,11 @@ package server
 import (
 	"bufio"
 	"bytes"
+	"crypto/aes"
+	"crypto/cipher"
+	"crypto/ecdh"
+	"crypto/rand"
+	"crypto/sha256"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -24,12 +29,50 @@ type ClientState struct {
 	mu       sync.Mutex
 	NextID   uint32
 	LastSeen time.Time
+
+	// Encryption State
+	SendState *CryptoState
+	RecvState *CryptoState
+}
+
+type CryptoState struct {
+	AESGCM cipher.AEAD
+	Nonce  uint64
 }
 
 var (
 	hostRegistry = make(map[string]*ClientState)
 	registryMu   sync.RWMutex
 )
+
+func deriveKey(shared []byte) []byte {
+	sum := sha256.Sum256(shared)
+	return sum[:]
+}
+
+func newAESGCM(key []byte) cipher.AEAD {
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		panic(err)
+	}
+	aead, err := cipher.NewGCM(block)
+	if err != nil {
+		panic(err)
+	}
+	return aead
+}
+
+func encrypt(aead cipher.AEAD, nonce uint64, plaintext []byte) []byte {
+	nonceBytes := make([]byte, aead.NonceSize())
+	binary.BigEndian.PutUint64(nonceBytes[len(nonceBytes)-8:], nonce)
+	return aead.Seal(nil, nonceBytes, plaintext, nil)
+}
+
+func decrypt(aead cipher.AEAD, nonce uint64, ciphertext []byte) ([]byte, error) {
+	nonceBytes := make([]byte, aead.NonceSize())
+	binary.BigEndian.PutUint64(nonceBytes[len(nonceBytes)-8:], nonce)
+	return aead.Open(nil, nonceBytes, ciphertext, nil)
+}
 
 func StartControlServer(port string) {
 	ln, err := net.Listen("tcp", port)
@@ -48,9 +91,64 @@ func StartControlServer(port string) {
 	}
 }
 
+func performServerHandshake(conn net.Conn) (*CryptoState, *CryptoState, error) {
+	// 1. Generate Server Keys (X25519)
+	curve := ecdh.X25519()
+	privKey, err := curve.GenerateKey(rand.Reader)
+	if err != nil {
+		return nil, nil, err
+	}
+	pubKey := privKey.PublicKey()
+
+	// 2. Read Client Public Key (Raw/Unencrypted)
+	frame, err := readFrame(conn)
+	if err != nil {
+		return nil, nil, err
+	}
+	if frame.Kind != protocol.KindHandshake {
+		return nil, nil, errors.New("expected handshake frame")
+	}
+
+	clientPubKey, err := curve.NewPublicKey(frame.Payload)
+	if err != nil {
+		return nil, nil, errors.New("invalid client public key")
+	}
+
+	// 3. Send Server Public Key (Raw/Unencrypted)
+	err = writeFrame(conn, protocol.Frame{
+		Kind:     protocol.KindHandshake,
+		StreamID: 0,
+		Payload:  pubKey.Bytes(),
+	})
+	if err != nil {
+		return nil, nil, err
+	}
+
+	// 4. Compute Shared Secret
+	sharedSecret, err := privKey.ECDH(clientPubKey)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	// 5. Derive Session Key
+	sessionKey := sha256.Sum256(sharedSecret)
+
+	block, _ := aes.NewCipher(sessionKey[:])
+	gcm, _ := cipher.NewGCM(block)
+
+	return &CryptoState{AESGCM: gcm, Nonce: 0}, &CryptoState{AESGCM: gcm, Nonce: 0}, nil
+}
+
 func handleAgentRegistration(conn net.Conn) {
 
-	frame, err := readFrame(conn)
+	sendState, recvState, err := performServerHandshake(conn)
+	if err != nil {
+		log.Printf("Handshake failed: %v", err)
+		conn.Close()
+		return
+	}
+
+	frame, err := readEncryptedFrame(conn, recvState)
 	if err != nil {
 		conn.Close()
 		return
@@ -79,13 +177,16 @@ func handleAgentRegistration(conn net.Conn) {
 	subdomain := ctrl.From
 
 	client := &ClientState{
-		ID:       subdomain,
-		Conn:     conn,
-		WriteCh:  make(chan protocol.Frame, 128),
-		Streams:  make(map[uint32]net.Conn),
-		NextID:   1,
-		LastSeen: time.Now(),
+		ID:        subdomain,
+		Conn:      conn,
+		WriteCh:   make(chan protocol.Frame, 128),
+		Streams:   make(map[uint32]net.Conn),
+		NextID:    1,
+		LastSeen:  time.Now(),
+		SendState: sendState,
+		RecvState: recvState,
 	}
+
 	registryMu.Lock()
 
 	if _, exists := hostRegistry[subdomain]; exists {
@@ -104,7 +205,7 @@ func handleAgentRegistration(conn net.Conn) {
 	go agentWriter(client)
 
 	for {
-		frame, err := readFrame(conn)
+		frame, err := readEncryptedFrame(conn, recvState)
 		if err != nil {
 			return
 		}
@@ -160,7 +261,7 @@ func handleBrowserRequest(browserConn net.Conn) {
 	registryMu.RUnlock()
 
 	if !ok {
-		browserConn.Write([]byte("HTTP/1.1 404 Not Found\r\nContent-Length: 17\r\n\r\nTunnel not found"))
+		browserConn.Write([]byte("HTTP/1.1 404 Not Found\r\nContent-Length: 16\r\n\r\nTunnel not found"))
 		browserConn.Close()
 		return
 	}
@@ -313,6 +414,10 @@ func agentWriter(client *ClientState) {
 	}()
 
 	for frame := range client.WriteCh {
+		state := client.SendState
+		frame.Payload = encrypt(state.AESGCM, state.Nonce, frame.Payload)
+		state.Nonce++
+
 		if err := writeFrame(client.Conn, frame); err != nil {
 			return
 		}
@@ -379,4 +484,22 @@ func StartHeartbeatReaper(timeout time.Duration) {
 		}
 		registryMu.Unlock()
 	}
+}
+
+func readEncryptedFrame(conn net.Conn, state *CryptoState) (protocol.Frame, error) {
+	// Read Raw Frame
+	frame, err := readFrame(conn)
+	if err != nil {
+		return protocol.Frame{}, err
+	}
+
+	// Use helper function to Decrypt
+	plaintext, err := decrypt(state.AESGCM, state.Nonce, frame.Payload)
+	if err != nil {
+		return protocol.Frame{}, errors.New("decryption failed: " + err.Error())
+	}
+	state.Nonce++
+
+	frame.Payload = plaintext
+	return frame, nil
 }

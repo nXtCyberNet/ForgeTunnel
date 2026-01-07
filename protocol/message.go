@@ -1,8 +1,9 @@
 package protocol
 
 const (
-	KindControl byte = 1
-	KindData    byte = 2
+	KindHandshake byte = 0
+	KindControl   byte = 1
+	KindData      byte = 2
 )
 
 type ControlMessage struct {

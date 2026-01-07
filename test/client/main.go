@@ -1,20 +1,31 @@
 package main
 
 import (
+	"forgetunnel/cmd/client" // Ensure this matches your go.mod module name
 	"log"
-
-	"forgetunnel/cmd/client"
+	"time"
 )
 
 func main() {
-	// CONFIG
-	serverAddr := "127.0.0.1:7000" // Control plane
-	clientID := "myapp"            // Subdomain: myapp.tunnel.com
+	// --- Configuration ---
+	// The address of your 'forgetunnel' server (Control Plane)
+	serverAddr := "localhost:8080"
 
-	log.Println("Starting Forgetunnel Client")
+	// The subdomain you want to claim (e.g. "website.localhost")
+	subdomain := "website"
 
-	err := client.StartClient(serverAddr, clientID)
-	if err != nil {
-		log.Fatalf("Client exited: %v", err)
+	// The ID is just for logging/debugging
+
+	log.Printf("Starting Client: Connecting to %s", serverAddr)
+	log.Printf("Tunneling http://%s.localhost -> localhost:3000", subdomain)
+
+	// --- Retry Loop ---
+	for {
+		// This function blocks until the connection is lost
+		err := client.StartClient(serverAddr, subdomain)
+
+		log.Printf("Disconnected: %v", err)
+		log.Println("Reconnecting in 5 seconds...")
+		time.Sleep(5 * time.Second)
 	}
 }

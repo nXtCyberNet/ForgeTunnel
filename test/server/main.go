@@ -1,29 +1,35 @@
 package main
 
 import (
+	"forgetunnel/cmd/server" // Ensure this matches your go.mod module name
 	"log"
-	"time"
-
-	"forgetunnel/cmd/server"
+	"os"
+	"os/signal"
+	"syscall"
 )
 
 func main() {
-	// CONFIG
-	controlAddr := ":7000" // Agent ↔ Server (tunnel)
-	publicAddr := ":8080"  // Browser ↔ Server (HTTP)
-	heartbeatTimeout := 30 * time.Second
+	// 1. Start Control Server (Port 8080)
+	// Agents (the Go client) connect here to register and maintain the tunnel.
+	go func() {
+		log.Println("Starting Control Server on :8080...")
+		// This blocks, so we run it in a goroutine
+		server.StartControlServer(":8080")
+	}()
 
-	log.Println("Starting Forgetunnel Server")
+	// 2. Start Public HTTP Server (Port 80)
+	// External users/browsers connect here (e.g., http://myapp.localhost).
+	go func() {
+		log.Println("Starting Public HTTP Server on :80...")
+		// Note: On Mac/Linux, you might need 'sudo' to bind to port 80.
+		// If that's annoying, change this to ":8000" and access via http://myapp.localhost:8000
+		server.StartPublicHttpServer(":8000")
+	}()
 
-	// Start heartbeat reaper
-	go server.StartHeartbeatReaper(heartbeatTimeout)
-
-	// Start control plane (agents)
-	go server.StartControlServer(controlAddr)
-
-	// Start public HTTP entrypoint
-	go server.StartPublicHttpServer(publicAddr)
-
-	// Block forever
-	select {}
+	// 3. Keep Alive
+	// Block the main thread until we receive Ctrl+C
+	c := make(chan os.Signal, 1)
+	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
+	<-c
+	log.Println("\nShutting down servers...")
 }

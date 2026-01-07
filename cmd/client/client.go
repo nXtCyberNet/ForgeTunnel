@@ -1,6 +1,11 @@
 package client
 
 import (
+	"crypto/aes"
+	"crypto/cipher"
+	"crypto/ecdh"
+	"crypto/rand"
+	"crypto/sha256"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -15,6 +20,16 @@ import (
 type StreamState struct {
 	ID   uint32
 	Conn net.Conn
+}
+
+type SecureConn struct {
+	Send CryptoState // client → server
+	Recv CryptoState // server → client
+}
+
+type CryptoState struct {
+	AESGCM cipher.AEAD
+	Nonce  uint64
 }
 
 var (
@@ -42,6 +57,79 @@ func SendRegistor(clientID string, writeCh chan protocol.Frame) error {
 
 }
 
+func newAESGCM(key []byte) cipher.AEAD {
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		panic(err)
+	}
+	aead, err := cipher.NewGCM(block)
+	if err != nil {
+		panic(err)
+	}
+	return aead
+}
+
+func encrypt(aead cipher.AEAD, nonce uint64, plaintext []byte) []byte {
+	nonceBytes := make([]byte, aead.NonceSize())
+	binary.BigEndian.PutUint64(nonceBytes[len(nonceBytes)-8:], nonce)
+	return aead.Seal(nil, nonceBytes, plaintext, nil)
+}
+
+func decrypt(aead cipher.AEAD, nonce uint64, ciphertext []byte) ([]byte, error) {
+	nonceBytes := make([]byte, aead.NonceSize())
+	binary.BigEndian.PutUint64(nonceBytes[len(nonceBytes)-8:], nonce)
+	return aead.Open(nil, nonceBytes, ciphertext, nil)
+}
+
+func performHandshake(conn net.Conn) (*CryptoState, *CryptoState, error) {
+	curve := ecdh.X25519()
+	privKey, err := curve.GenerateKey(rand.Reader)
+	if err != nil {
+		return nil, nil, err
+	}
+	pubKey := privKey.PublicKey()
+
+	err = writeFrame(conn, protocol.Frame{
+		Kind:     protocol.KindHandshake,
+		StreamID: 0,
+		Payload:  pubKey.Bytes(),
+	})
+	if err != nil {
+		return nil, nil, err
+	}
+
+	// 3. Read Server's Public Key (Raw Frame)
+	frame, err := readFrame(conn)
+	if err != nil {
+		return nil, nil, err
+	}
+	if frame.Kind != protocol.KindHandshake {
+		return nil, nil, errors.New("expected handshake frame")
+	}
+
+	serverPubKey, err := curve.NewPublicKey(frame.Payload)
+	if err != nil {
+		return nil, nil, errors.New("invalid server public key")
+	}
+
+	// 4. Compute Shared Secret
+
+	sharedSecret, err := privKey.ECDH(serverPubKey)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	// 5. Derive Session Key (SHA-256 hash)
+	sessionKey := sha256.Sum256(sharedSecret)
+	log.Println("Handshake complete. Session secured.")
+
+	// Create Cipher
+	gcm := newAESGCM(sessionKey[:])
+
+	// Return distinct states for Send and Recv (nonces start at 0)
+	return &CryptoState{AESGCM: gcm, Nonce: 0}, &CryptoState{AESGCM: gcm, Nonce: 0}, nil
+}
+
 func StartClient(serverAddr, clientID string) error {
 	conn, err := net.Dial("tcp", serverAddr)
 	if err != nil {
@@ -51,10 +139,15 @@ func StartClient(serverAddr, clientID string) error {
 
 	log.Printf("Connected to server at %s", serverAddr)
 
+	sendState, recvState, err := performHandshake(conn)
+	if err != nil {
+		return err
+	}
+
 	writeCh := make(chan protocol.Frame, 128)
 	stop := make(chan struct{})
 
-	go writer(conn, writeCh, stop)
+	go writer(conn, writeCh, stop, sendState)
 	if err := SendRegistor(clientID, writeCh); err != nil {
 		return err
 	}
@@ -62,7 +155,7 @@ func StartClient(serverAddr, clientID string) error {
 	go startHeartbeat(writeCh, clientID, stop)
 
 	for {
-		frame, err := readFrame(conn)
+		frame, err := readEncryptedFrame(conn, recvState)
 		if err != nil {
 			close(writeCh)
 			return err
@@ -93,7 +186,7 @@ func handleControl(msg protocol.ControlMessage, writeCh chan<- protocol.Frame) {
 	case "close_stream":
 		closeLocalStream(msg.StreamID)
 		log.Println("got the close_stream message ")
-		log.Printf("%s", msg.StreamID)
+		log.Println(msg.StreamID)
 	}
 }
 
@@ -218,13 +311,18 @@ func startHeartbeat(writeCh chan<- protocol.Frame, clientID string, stop <-chan 
 	}
 }
 
-func writer(conn net.Conn, writeCh <-chan protocol.Frame, stop <-chan struct{}) {
+func writer(conn net.Conn, writeCh <-chan protocol.Frame, stop <-chan struct{}, state *CryptoState) {
 	for {
 		select {
 		case frame, ok := <-writeCh:
+
 			if !ok {
 				return
 			}
+			payload := encrypt(state.AESGCM, state.Nonce, frame.Payload)
+			state.Nonce++
+
+			frame.Payload = payload
 			if err := writeFrame(conn, frame); err != nil {
 				log.Println("frame send ")
 				return
@@ -280,4 +378,22 @@ func writeFrame(conn net.Conn, frame protocol.Frame) error {
 
 	_, err := conn.Write(frame.Payload)
 	return err
+}
+
+func readEncryptedFrame(conn net.Conn, state *CryptoState) (protocol.Frame, error) {
+	// 1. Read Frame off wire
+	frame, err := readFrame(conn)
+	if err != nil {
+		return protocol.Frame{}, err
+	}
+
+	// 2. Decrypt Payload
+	plaintext, err := decrypt(state.AESGCM, state.Nonce, frame.Payload)
+	if err != nil {
+		return protocol.Frame{}, errors.New("decryption failed: " + err.Error())
+	}
+	state.Nonce++
+
+	frame.Payload = plaintext
+	return frame, nil
 }
