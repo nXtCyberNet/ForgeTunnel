@@ -1,1 +1,3 @@
-go.mod
+# Go modules
+!go.mod
+!go.sum
