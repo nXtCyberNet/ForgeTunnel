@@ -89,7 +89,7 @@ func decrypt(aead cipher.AEAD, nonce uint64, ciphertext, aad []byte) ([]byte, er
 }
 
 func performHandshake(conn net.Conn) (*CryptoState, *CryptoState, error) {
-	// 1. Generate Ephemeral Keys (Same as before)
+
 	curve := ecdh.X25519()
 	privKey, err := curve.GenerateKey(rand.Reader)
 	if err != nil {
@@ -97,7 +97,6 @@ func performHandshake(conn net.Conn) (*CryptoState, *CryptoState, error) {
 	}
 	pubKey := privKey.PublicKey()
 
-	// 2. Send Client Public Key (Same as before)
 	err = writeFrame(conn, protocol.Frame{
 		Kind:     protocol.KindHandshake,
 		StreamID: 0,
@@ -107,14 +106,11 @@ func performHandshake(conn net.Conn) (*CryptoState, *CryptoState, error) {
 		return nil, nil, err
 	}
 
-	// 3. Read Server Response
 	frame, err := readFrame(conn)
 	if err != nil {
 		return nil, nil, err
 	}
 
-	// --- NEW VERIFICATION STEP ---
-	// Payload should be 32 bytes (Key) + 64 bytes (Sig) = 96 bytes
 	if len(frame.Payload) != 96 {
 		return nil, nil, errors.New("invalid handshake size")
 	}
@@ -122,15 +118,11 @@ func performHandshake(conn net.Conn) (*CryptoState, *CryptoState, error) {
 	serverEphemeralKey := frame.Payload[:32]
 	signature := frame.Payload[32:]
 
-	// Verify the signature
-	// "Did the Static Key sign this Ephemeral Key?"
 	valid := ed25519.Verify(serverStaticPubKey, serverEphemeralKey, signature)
 	if !valid {
 		return nil, nil, errors.New("MITM DETECTED: Invalid Server Signature!")
 	}
-	// -----------------------------
 
-	// 4. Continue as normal
 	serverPubKey, err := curve.NewPublicKey(serverEphemeralKey)
 	if err != nil {
 		return nil, nil, err
@@ -165,8 +157,6 @@ func StartClient(serverAddr, clientID string, port int) error {
 	writeCh := make(chan protocol.Frame, 128)
 	stop := make(chan struct{})
 
-	// FIX 1: Close 'stop' when this function exits.
-	// This tells startHeartbeat and writer to stop cleanly.
 	defer close(stop)
 
 	go writer(conn, writeCh, stop, sendState)
@@ -180,8 +170,7 @@ func StartClient(serverAddr, clientID string, port int) error {
 	for {
 		frame, err := readEncryptedFrame(conn, recvState)
 		if err != nil {
-			// FIX 2: DELETE THIS LINE -> close(writeCh)
-			// Just return. The 'defer close(stop)' above handles the cleanup.
+
 			return err
 		}
 
@@ -317,9 +306,9 @@ func startHeartbeat(writeCh chan<- protocol.Frame, clientID string, stop <-chan 
 	for {
 		select {
 		case <-stop:
-			return // Stop signal received, exit immediately
+			return
 		case <-ticker.C:
-			// Check stop again before doing work, just in case
+
 			select {
 			case <-stop:
 				return
@@ -332,16 +321,15 @@ func startHeartbeat(writeCh chan<- protocol.Frame, clientID string, stop <-chan 
 			}
 			payload, _ := json.Marshal(ctrl)
 
-			// Try to send, but abort if 'stop' is closed
 			select {
 			case writeCh <- protocol.Frame{
 				Kind:     protocol.KindControl,
 				StreamID: 0,
 				Payload:  payload,
 			}:
-				// Success
+
 			case <-stop:
-				return // Abort send if stopping
+				return
 			}
 		}
 	}
