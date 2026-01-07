@@ -68,7 +68,7 @@ cd forgetunnel
 
 ForgeTunnel uses a **Trust-On-First-Use (TOFU)** / key-pinning model similar to SSH.
 
-Create a helper file `key-gen.go`:
+Create a helper file `gen_keys.go`:
 
 ```go
 package main
@@ -176,6 +176,28 @@ ForgeTunnel does **not** use HTTP for transport. All data flows over raw TCP fra
 ---
 
 ## 📊 Benchmarks & Performance
+
+### 📸 Benchmark Screenshots
+
+The following terminal screenshots were captured during real benchmark runs and are included for transparency and verification.
+
+#### Single Client Benchmark
+
+* Single active client
+* Large payload transfer
+* Shows raw tunnel stability and bandwidth behavior
+
+![Single Client Benchmark](assets/single.png)
+
+#### Multi Client Benchmark
+
+* 4 threads
+* 100 concurrent connections
+* Demonstrates multiplexing and concurrency handling
+
+![Multi Client Benchmark](assets/multi.png)
+
+---
 
 ### Network Conditions
 
