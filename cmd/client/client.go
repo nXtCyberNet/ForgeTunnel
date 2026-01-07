@@ -4,9 +4,11 @@ import (
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/ecdh"
+	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"forgetunnel/protocol"
@@ -17,14 +19,17 @@ import (
 	"time"
 )
 
+var serverStaticPubKeyBytes, _ = hex.DecodeString("ec3b1f069fdd7b8372cd4726a1873e5869992a08aebbb1a5476617ec6519acde")
+var serverStaticPubKey = ed25519.PublicKey(serverStaticPubKeyBytes)
+
 type StreamState struct {
 	ID   uint32
 	Conn net.Conn
 }
 
 type SecureConn struct {
-	Send CryptoState // client → server
-	Recv CryptoState // server → client
+	Send CryptoState
+	Recv CryptoState
 }
 
 type CryptoState struct {
@@ -69,19 +74,21 @@ func newAESGCM(key []byte) cipher.AEAD {
 	return aead
 }
 
-func encrypt(aead cipher.AEAD, nonce uint64, plaintext []byte) []byte {
+func encrypt(aead cipher.AEAD, nonce uint64, plaintext, aad []byte) []byte {
 	nonceBytes := make([]byte, aead.NonceSize())
 	binary.BigEndian.PutUint64(nonceBytes[len(nonceBytes)-8:], nonce)
-	return aead.Seal(nil, nonceBytes, plaintext, nil)
+	return aead.Seal(nil, nonceBytes, plaintext, aad)
 }
 
-func decrypt(aead cipher.AEAD, nonce uint64, ciphertext []byte) ([]byte, error) {
+func decrypt(aead cipher.AEAD, nonce uint64, ciphertext, aad []byte) ([]byte, error) {
 	nonceBytes := make([]byte, aead.NonceSize())
 	binary.BigEndian.PutUint64(nonceBytes[len(nonceBytes)-8:], nonce)
-	return aead.Open(nil, nonceBytes, ciphertext, nil)
+
+	return aead.Open(nil, nonceBytes, ciphertext, aad)
 }
 
 func performHandshake(conn net.Conn) (*CryptoState, *CryptoState, error) {
+	// 1. Generate Ephemeral Keys (Same as before)
 	curve := ecdh.X25519()
 	privKey, err := curve.GenerateKey(rand.Reader)
 	if err != nil {
@@ -89,6 +96,7 @@ func performHandshake(conn net.Conn) (*CryptoState, *CryptoState, error) {
 	}
 	pubKey := privKey.PublicKey()
 
+	// 2. Send Client Public Key (Same as before)
 	err = writeFrame(conn, protocol.Frame{
 		Kind:     protocol.KindHandshake,
 		StreamID: 0,
@@ -98,35 +106,44 @@ func performHandshake(conn net.Conn) (*CryptoState, *CryptoState, error) {
 		return nil, nil, err
 	}
 
-	// 3. Read Server's Public Key (Raw Frame)
+	// 3. Read Server Response
 	frame, err := readFrame(conn)
 	if err != nil {
 		return nil, nil, err
 	}
-	if frame.Kind != protocol.KindHandshake {
-		return nil, nil, errors.New("expected handshake frame")
+
+	// --- NEW VERIFICATION STEP ---
+	// Payload should be 32 bytes (Key) + 64 bytes (Sig) = 96 bytes
+	if len(frame.Payload) != 96 {
+		return nil, nil, errors.New("invalid handshake size")
 	}
 
-	serverPubKey, err := curve.NewPublicKey(frame.Payload)
+	serverEphemeralKey := frame.Payload[:32]
+	signature := frame.Payload[32:]
+
+	// Verify the signature
+	// "Did the Static Key sign this Ephemeral Key?"
+	valid := ed25519.Verify(serverStaticPubKey, serverEphemeralKey, signature)
+	if !valid {
+		return nil, nil, errors.New("MITM DETECTED: Invalid Server Signature!")
+	}
+	// -----------------------------
+
+	// 4. Continue as normal
+	serverPubKey, err := curve.NewPublicKey(serverEphemeralKey)
 	if err != nil {
-		return nil, nil, errors.New("invalid server public key")
+		return nil, nil, err
 	}
-
-	// 4. Compute Shared Secret
 
 	sharedSecret, err := privKey.ECDH(serverPubKey)
 	if err != nil {
 		return nil, nil, err
 	}
 
-	// 5. Derive Session Key (SHA-256 hash)
 	sessionKey := sha256.Sum256(sharedSecret)
-	log.Println("Handshake complete. Session secured.")
+	block, _ := aes.NewCipher(sessionKey[:])
+	gcm, _ := cipher.NewGCM(block)
 
-	// Create Cipher
-	gcm := newAESGCM(sessionKey[:])
-
-	// Return distinct states for Send and Recv (nonces start at 0)
 	return &CryptoState{AESGCM: gcm, Nonce: 0}, &CryptoState{AESGCM: gcm, Nonce: 0}, nil
 }
 
@@ -147,7 +164,12 @@ func StartClient(serverAddr, clientID string) error {
 	writeCh := make(chan protocol.Frame, 128)
 	stop := make(chan struct{})
 
+	// FIX 1: Close 'stop' when this function exits.
+	// This tells startHeartbeat and writer to stop cleanly.
+	defer close(stop)
+
 	go writer(conn, writeCh, stop, sendState)
+
 	if err := SendRegistor(clientID, writeCh); err != nil {
 		return err
 	}
@@ -157,7 +179,8 @@ func StartClient(serverAddr, clientID string) error {
 	for {
 		frame, err := readEncryptedFrame(conn, recvState)
 		if err != nil {
-			close(writeCh)
+			// FIX 2: DELETE THIS LINE -> close(writeCh)
+			// Just return. The 'defer close(stop)' above handles the cleanup.
 			return err
 		}
 
@@ -193,7 +216,6 @@ func handleControl(msg protocol.ControlMessage, writeCh chan<- protocol.Frame) {
 func handleData(streamID uint32, payload []byte) {
 	var stream *StreamState
 
-	// wait up to 100ms for stream to appear
 	for i := 0; i < 10; i++ {
 		sm.Lock()
 		stream = streams[streamID]
@@ -292,26 +314,40 @@ func startHeartbeat(writeCh chan<- protocol.Frame, clientID string, stop <-chan 
 
 	for {
 		select {
+		case <-stop:
+			return // Stop signal received, exit immediately
 		case <-ticker.C:
+			// Check stop again before doing work, just in case
+			select {
+			case <-stop:
+				return
+			default:
+			}
+
 			ctrl := protocol.ControlMessage{
 				Type: "heartbeat",
 				From: clientID,
 			}
 			payload, _ := json.Marshal(ctrl)
 
-			writeCh <- protocol.Frame{
+			// Try to send, but abort if 'stop' is closed
+			select {
+			case writeCh <- protocol.Frame{
 				Kind:     protocol.KindControl,
 				StreamID: 0,
 				Payload:  payload,
+			}:
+				// Success
+			case <-stop:
+				return // Abort send if stopping
 			}
-
-		case <-stop:
-			return
 		}
 	}
 }
 
 func writer(conn net.Conn, writeCh <-chan protocol.Frame, stop <-chan struct{}, state *CryptoState) {
+	headerBuf := make([]byte, 5)
+
 	for {
 		select {
 		case frame, ok := <-writeCh:
@@ -319,7 +355,10 @@ func writer(conn net.Conn, writeCh <-chan protocol.Frame, stop <-chan struct{}, 
 			if !ok {
 				return
 			}
-			payload := encrypt(state.AESGCM, state.Nonce, frame.Payload)
+			headerBuf[0] = frame.Kind
+			binary.BigEndian.PutUint32(headerBuf[1:], frame.StreamID)
+
+			payload := encrypt(state.AESGCM, state.Nonce, frame.Payload, headerBuf)
 			state.Nonce++
 
 			frame.Payload = payload
@@ -381,14 +420,16 @@ func writeFrame(conn net.Conn, frame protocol.Frame) error {
 }
 
 func readEncryptedFrame(conn net.Conn, state *CryptoState) (protocol.Frame, error) {
-	// 1. Read Frame off wire
+
 	frame, err := readFrame(conn)
 	if err != nil {
 		return protocol.Frame{}, err
 	}
+	headerBuf := make([]byte, 5)
+	headerBuf[0] = frame.Kind
+	binary.BigEndian.PutUint32(headerBuf[1:], frame.StreamID)
 
-	// 2. Decrypt Payload
-	plaintext, err := decrypt(state.AESGCM, state.Nonce, frame.Payload)
+	plaintext, err := decrypt(state.AESGCM, state.Nonce, frame.Payload, headerBuf)
 	if err != nil {
 		return protocol.Frame{}, errors.New("decryption failed: " + err.Error())
 	}
