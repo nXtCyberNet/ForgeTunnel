@@ -11,6 +11,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"forgetunnel/protocol"
 	"io"
 	"log"
@@ -147,7 +148,7 @@ func performHandshake(conn net.Conn) (*CryptoState, *CryptoState, error) {
 	return &CryptoState{AESGCM: gcm, Nonce: 0}, &CryptoState{AESGCM: gcm, Nonce: 0}, nil
 }
 
-func StartClient(serverAddr, clientID string) error {
+func StartClient(serverAddr, clientID string, port int) error {
 	conn, err := net.Dial("tcp", serverAddr)
 	if err != nil {
 		return err
@@ -191,7 +192,7 @@ func StartClient(serverAddr, clientID string) error {
 				log.Printf("Failed to unmarshal control msg: %v", err)
 				continue
 			}
-			handleControl(ctrl, writeCh)
+			handleControl(ctrl, writeCh, port)
 
 		case protocol.KindData:
 			handleData(frame.StreamID, frame.Payload)
@@ -199,12 +200,12 @@ func StartClient(serverAddr, clientID string) error {
 	}
 }
 
-func handleControl(msg protocol.ControlMessage, writeCh chan<- protocol.Frame) {
+func handleControl(msg protocol.ControlMessage, writeCh chan<- protocol.Frame, port int) {
 	switch msg.Type {
 	case "open_stream":
 		log.Println("got the open_stream message ")
 		log.Println(msg.StreamID)
-		go openLocalStream(msg.StreamID, writeCh)
+		go openLocalStream(msg.StreamID, writeCh, port)
 
 	case "close_stream":
 		closeLocalStream(msg.StreamID)
@@ -238,8 +239,9 @@ func handleData(streamID uint32, payload []byte) {
 	}
 }
 
-func openLocalStream(streamID uint32, writeCh chan<- protocol.Frame) {
-	conn, err := net.Dial("tcp", "127.0.0.1:3000")
+func openLocalStream(streamID uint32, writeCh chan<- protocol.Frame, port int) {
+	addr := fmt.Sprintf("127.0.0.1:%d", port)
+	conn, err := net.Dial("tcp", addr)
 	if err != nil {
 		log.Printf("Failed to dial local app: %v", err)
 		sendCloseStream(streamID, writeCh)
