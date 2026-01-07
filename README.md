@@ -181,6 +181,15 @@ ForgeTunnel does **not** use HTTP for transport. All data flows over raw TCP fra
 
 The following terminal screenshots were captured during real benchmark runs and are included for transparency and verification.
 
+
+####  Terminal layout explanation:
+
+* Left terminal: tcpdump capturing raw TCP packets on the tunnel interface, showing continuous encrypted traffic flow, ACKs, window scaling, and retransmissions.
+* Local application server logs (python -m http.server) confirming successful request delivery from the tunnel.
+* Right terminal: Benchmark client issuing requests through ForgeTunnel and displaying t Throughput and transfer statistics.
+
+
+
 #### Single Client Benchmark
 
 * Single active client
